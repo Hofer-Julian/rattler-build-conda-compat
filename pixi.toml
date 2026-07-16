@@ -21,6 +21,10 @@ build_sdist = "pixi run python -m build --sdist"
 
 [dependencies]
 rattler-build-conda-compat = { path = "." }
+# Source dependency: build py-rattler-build from the branch behind
+# https://github.com/prefix-dev/rattler-build/pull/2662 so the compat layer
+# renders recipes with rattler-build's own engine.
+py-rattler-build = { git = "https://github.com/prefix-dev/rattler-build.git", branch = "lenient-render-context", subdirectory = "py-rattler-build" }
 python = ">=3.10"
 python-build = ">=1.3.0,<2"
 rattler-build = ">=0.61.4,<0.62"

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import jinja2
 from jinja2.sandbox import SandboxedEnvironment
+from rattler_build.jinja_config import JinjaConfig
+from rattler_build.render import render_context as _render_context
+from rattler_build.tool_config import PlatformConfig
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString, SingleQuotedScalarString
 
 from rattler_build_conda_compat.jinja.filters import _bool, _split, _version_to_build_string
@@ -15,7 +19,6 @@ from rattler_build_conda_compat.jinja.objects import (
 )
 from rattler_build_conda_compat.jinja.utils import _MissingUndefined
 from rattler_build_conda_compat.loader import load_yaml
-from rattler_build_conda_compat.yaml import _dump_yaml_to_string
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -152,14 +155,50 @@ def render_recipe_with_context(
     >>>
     ```
     """
-    env = jinja_env(variant_config)
-    context = recipe_content.get("context", {})
-    # render out the context section and retrieve dictionary
-    context_variables = load_recipe_context(context, env)
+    rendered = _render_context(recipe_content, _context_jinja_config(variant_config))
+    return _apply_lint_stubs(rendered)  # type: ignore[no-any-return]
 
-    # render the rest of the document with the values from the context
-    # and keep undefined expressions _as is_.
-    template = env.from_string(_dump_yaml_to_string(recipe_content))
-    rendered_content = template.render(context_variables)
 
-    return load_yaml(rendered_content)  # type: ignore[no-any-return]
+def _context_jinja_config(variant_config: Mapping[str, str] | None) -> JinjaConfig:
+    """Build a lenient `JinjaConfig` from a conda-smithy variant mapping."""
+    variant = dict(variant_config) if variant_config else {}
+    target_platform = str(variant.get("target_platform", "linux-64"))
+    platform = PlatformConfig(target_platform=target_platform)
+    return JinjaConfig(platform=platform, variant=variant, allow_undefined=True)
+
+
+# rattler-build's engine leaves build-phase helper calls (`compiler`,
+# `pin_subpackage`, ...) verbatim during context rendering. conda-smithy expects
+# these in a stubbed form, so we map the surviving `${{ ... }}` calls to the
+# same stubs the pure-python environment used to produce.
+_STUB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"""\$\{\{\s*compiler\(\s*['"]([^'"]+)['"][^}]*\)\s*\}\}"""), r"\1_compiler_stub"),
+    (re.compile(r"""\$\{\{\s*stdlib\(\s*['"]([^'"]+)['"][^}]*\)\s*\}\}"""), r"\1_stdlib_stub"),
+    (
+        re.compile(r"""\$\{\{\s*pin_subpackage\(\s*['"]([^'"]+)['"][^}]*\)\s*\}\}"""),
+        r"subpackage_pin \1",
+    ),
+    (
+        re.compile(r"""\$\{\{\s*pin_compatible\(\s*['"]([^'"]+)['"][^}]*\)\s*\}\}"""),
+        r"compatible_pin \1",
+    ),
+    (re.compile(r"""\$\{\{\s*cdt\([^}]*\)\s*\}\}"""), "cdt_stub"),
+    (
+        re.compile(r"""\$\{\{\s*env\.exists\(\s*['"]([^'"]+)['"][^}]*\)\s*\}\}"""),
+        r'env_exists_"\1" ',
+    ),
+    (re.compile(r"""\$\{\{\s*env\.get\(\s*['"]([^'"]+)['"][^}]*\)\s*\}\}"""), r'env_"\1" '),
+]
+
+
+def _apply_lint_stubs(obj: Any) -> Any:  # noqa: ANN401
+    """Recursively map verbatim recipe helper calls to conda-smithy stubs."""
+    if isinstance(obj, str):
+        for pattern, replacement in _STUB_PATTERNS:
+            obj = pattern.sub(replacement, obj)
+        return obj
+    if isinstance(obj, dict):
+        return {key: _apply_lint_stubs(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_apply_lint_stubs(value) for value in obj]
+    return obj
